@@ -285,7 +285,7 @@ To display the value of `addr`, simply type `addr` in the console.
 // Get the last round of the wallet
 lastRound = await wallet.getLastRound()
 ```
-To change the node you are connected to, you can change the value of `NODE_HOST` in the `.env` file. The default value is `testnet-api.algonode.cloud`.
+To change the node you are connected to, switch the network block in `.env.template` and copy it to `.env`. Localnet (`localhost`) is the default. Testnet (`testnet-api.algonode.cloud`) is the commented alternative.
 
 5) **Fetch instance of Crafter to help craft txns**
 ```ts
