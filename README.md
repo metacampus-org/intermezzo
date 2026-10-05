@@ -48,6 +48,17 @@ This is mostly defined by Hashicorp Vault. The application will use the `approle
 
 For most information, you can refer to the [Hashicorp Vault ACL documentation](https://www.vaultproject.io/docs/auth/approle).
 
+### Device Attestation & Credential Issuance
+
+Pawn provides generic OID4VC (OpenID for Verifiable Credential Issuance) tools. It does **not** provide a built-in device attestation endpoint, as attestation requirements (e.g., Apple App Attest, Google Play Integrity) vary significantly between platforms and applications.
+
+Downstream consumers (managers) are responsible for:
+1.  Verifying the device integrity or user identity out-of-band.
+2.  Using the `/v1/credential/issuer/offers` endpoint to create a pre-authorized credential offer for the user's `did:key`.
+3.  Distributing the offer URI/QR code to the user's wallet.
+
+Once the user's wallet redeems the credential, it can be used to authenticate subsequent requests to Pawn (e.g., for `did:algo` deployment) via the `CredentialAuthGuard`.
+
 
 # Setup Development Environment
 
@@ -94,6 +105,63 @@ This command's output will provide you 4 important pieces of information:
 5) Make sure Manager's address has enough ALGO for usage OR to run integration tests. You can use https://bank.testnet.algorand.network/ to dispense some ALGO.
 
 You can re-run `vault:development:init` whenever you want.
+
+## Post-quantum user accounts
+
+Intermezzo supports opt-in Algorand Falcon-1024 user accounts. They require
+algod 5 or newer and the custom Vault plugin:
+
+```bash
+./scripts/build_vault_plugin.sh
+docker compose up -d vault pawn
+docker compose exec -T pawn yarn vault:development:init
+```
+
+Set `VAULT_PQ_USERS_PATH` to the plugin mount path; development defaults to
+`pawn/pq-users`. The initialization command registers the plugin, mounts it,
+and installs the development policies.
+
+The plugin creates and stores Falcon keys and returns the base64 public key.
+Intermezzo derives the canonical salt and Algorand address from that key, and
+includes the salt in the transaction's PQ signature envelope. The salt is public
+and recomputed when needed; secret entropy and private keys stay in Vault.
+
+Create a PQ account through the existing endpoint:
+
+```http
+POST /v1/wallet/user/
+Authorization: Bearer {access-token}
+Content-Type: application/json
+
+{
+  "user_id": "alice-pq",
+  "account_type": "falcon1024"
+}
+```
+
+Omitting `account_type` continues to create an Ed25519 account. User responses
+now include `account_type`, so clients that reject unknown response fields must
+update their schema.
+
+A user ID is permanently assigned one account type. Ed25519 and Falcon keys
+produce different addresses, and an existing Ed25519 account cannot be migrated
+to PQ. Retrying the same user ID and account type is idempotent; requesting the
+other type returns `409 Conflict`. New user IDs may contain letters, digits,
+and underscores; dots and hyphens are allowed only internally.
+
+Key creation and signing retain the caller's Vault authorization. The service
+AppRole coordinates account-type claims and PQ discovery; it does not grant the
+caller signing access. PQ transaction fees and envelopes are applied
+automatically.
+
+DID operations require Ed25519 keys. DID listings skip unsupported keys, and
+PQ transaction signatures are rejected before manager signing or broadcast.
+
+Deploy this claim-aware version to every application instance before enabling
+PQ account creation. No audit or backfill is required because PQ creation has
+not previously been deployed. Create accounts through the application endpoint;
+direct writes to the Vault mounts bypass the account-type claim. Manager
+accounts remain Ed25519.
 
 ## HTTP API mode
 
@@ -217,7 +285,7 @@ To display the value of `addr`, simply type `addr` in the console.
 // Get the last round of the wallet
 lastRound = await wallet.getLastRound()
 ```
-To change the node you are connected to, you can change the value of `NODE_HOST` in the `.env` file. The default value is `testnet-api.algonode.cloud`.
+To change the node you are connected to, switch the network block in `.env.template` and copy it to `.env`. Localnet (`localhost`) is the default. Testnet (`testnet-api.algonode.cloud`) is the commented alternative.
 
 5) **Fetch instance of Crafter to help craft txns**
 ```ts
@@ -281,6 +349,27 @@ You can use https://bank.testnet.algorand.network/ to dispense some ALGO.
 
 ```
 yarn test:e2e
+```
+
+## Opt-in Status List Checks
+
+Skipped by default. Capacity check (1,000,001 allocations against an in-memory Vault):
+
+```sh
+STATUS_LIST_CAPACITY_TEST=1 yarn test --runInBand \
+  src/oid4vc/status/oid4vc-status.service.spec.ts -t '1,000,001'
+```
+
+Real Vault check, against a disposable dev Vault only (it creates and removes its own KV/transit mounts):
+
+```sh
+docker run --rm -d --name intermezzo-status-check \
+  -p 127.0.0.1:18200:8200 -e VAULT_DEV_ROOT_TOKEN_ID=status-check-only \
+  hashicorp/vault:1.15.6 server -dev -dev-listen-address=0.0.0.0:8200
+STATUS_LIST_VAULT_URL=http://127.0.0.1:18200 \
+STATUS_LIST_VAULT_TOKEN=status-check-only \
+  yarn test:e2e --runInBand status-list-vault
+docker stop intermezzo-status-check
 ```
 
 

@@ -1,15 +1,38 @@
 import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import {
-  AlgorandEncoder,
-  AlgorandTransactionCrafter,
-  AssetParamsBuilder,
-  AssetTransferTxBuilder,
-} from '@algorandfoundation/algo-models';
+
 import { HttpErrorByCode } from '@nestjs/common/utils/http-error-by-code.util';
 import { HttpService } from '@nestjs/axios';
 import { AxiosResponse } from 'axios';
 import { safeStringify } from '../util';
+import {
+  AccountAssetsResponse,
+  AssetHolding,
+  TruncatedAccountAssetResponse,
+  TruncatedAccountResponse,
+  TruncatedAssetHolding,
+  TruncatedPostTransactionsResponse,
+  TruncatedSuggestedParamsResponse,
+} from './algo-node-responses';
+import {
+  AppCallTransactionFields,
+  AssetConfigTransactionFields,
+  AssetTransferTransactionFields,
+  decodeTransaction,
+  encodeSignedTransaction,
+  encodeTransaction,
+  groupTransactions,
+  PaymentTransactionFields,
+  SignedTransaction,
+  Transaction,
+  TransactionParams,
+  TransactionType,
+} from '@algorandfoundation/algokit-utils/transact';
+import { Address } from '@algorandfoundation/algokit-utils';
+import { AppCallRequestDto } from '../wallet/app-call-request.dto';
+import { base64ToBytes, encodeString, encodeUint64 } from './encoding';
+import { sha512_256 } from 'js-sha512';
+import * as algosdk from 'algosdk';
 
 @Injectable()
 export class ChainService {
@@ -18,17 +41,34 @@ export class ChainService {
     private readonly httpService: HttpService,
   ) {}
 
-  private getCrafter(): AlgorandTransactionCrafter {
-    return new AlgorandTransactionCrafter(this.configService.get('GENESIS_ID'), this.configService.get('GENESIS_HASH'));
-  }
-
   private parseLease(lease: string): Uint8Array {
-    return new Uint8Array(Buffer.from(lease, 'base64'))
+    return new Uint8Array(Buffer.from(lease, 'base64'));
   }
 
   addSignatureToTxn(encodedTransaction: Uint8Array, signature: Uint8Array): Uint8Array {
-    let crafter = this.getCrafter();
-    return crafter.addSignature(encodedTransaction, signature);
+    const decodedTxn = decodeTransaction(encodedTransaction);
+    const stxn: SignedTransaction = { txn: decodedTxn, sig: signature };
+    return encodeSignedTransaction(stxn);
+  }
+
+  addPqSignatureToTxn(
+    encodedTransaction: Uint8Array,
+    pq: { scheme: string; salt: number; publicKey: Uint8Array; signature: Uint8Array },
+  ): Uint8Array {
+    const txn = algosdk.decodeUnsignedTransaction(encodedTransaction.slice(2));
+    return algosdk.encodeMsgpack(
+      new algosdk.SignedTransaction({
+        txn,
+        pqsig: { sch: Buffer.from(pq.scheme), slt: pq.salt, pk: pq.publicKey, sig: pq.signature },
+      }),
+    );
+  }
+
+  addPqFeeSurcharge(encodedTransaction: Uint8Array, minFee: number | bigint): Uint8Array {
+    const txn = decodeTransaction(encodedTransaction);
+    if (txn.group) throw new Error('PQ fee surcharge must be applied before grouping');
+    txn.fee += 2n * BigInt(minFee);
+    return encodeTransaction(txn);
   }
 
   /**
@@ -40,16 +80,9 @@ export class ChainService {
    * @returns The list of transactions with the group ID set.
    */
   setGroupID(txns: Uint8Array[]): Uint8Array[] {
-    let groupId = new AlgorandEncoder().computeGroupId(txns);
-
-    let grouped: Uint8Array[] = [];
-    for (let txn of txns) {
-      let decodedTx = new AlgorandEncoder().decodeTransaction(txn);
-      decodedTx.grp = groupId;
-      grouped.push(new AlgorandEncoder().encodeTransaction(decodedTx));
-    }
-
-    return grouped;
+    const decodedTxns = txns.map(decodeTransaction);
+    const groupedTxns = groupTransactions(decodedTxns);
+    return groupedTxns.map(encodeTransaction);
   }
 
   async craftAssetCreateTx(
@@ -67,30 +100,37 @@ export class ChainService {
       clawbackAddress?: string;
     },
   ): Promise<Uint8Array> {
-    let crafter = this.getCrafter();
-    let suggested_params: TruncatedSuggestedParamsResponse = await this.getSuggestedParams();
+    const suggested_params: TruncatedSuggestedParamsResponse = await this.getSuggestedParams();
 
-    let paramsBuilder = new AssetParamsBuilder();
-    if (options.total) paramsBuilder.addTotal(options.total);
-    if (options.decimals) paramsBuilder.addDecimals(Number(options.decimals));
-    if (options.defaultFrozen) paramsBuilder.addDefaultFrozen(options.defaultFrozen);
-    if (options.unitName) paramsBuilder.addUnitName(options.unitName);
-    if (options.assetName) paramsBuilder.addAssetName(options.assetName);
-    if (options.managerAddress) paramsBuilder.addManagerAddress(options.managerAddress);
-    if (options.reserveAddress) paramsBuilder.addReserveAddress(options.reserveAddress);
-    if (options.freezeAddress) paramsBuilder.addFreezeAddress(options.freezeAddress);
-    if (options.clawbackAddress) paramsBuilder.addClawbackAddress(options.clawbackAddress);
+    const assetParams: AssetConfigTransactionFields = {
+      assetId: 0n,
+      total: BigInt(options.total),
+      decimals: Number(options.decimals),
+      defaultFrozen: options.defaultFrozen,
+      unitName: options.unitName,
+      assetName: options.assetName,
+      url: options.url,
+      // Only include optional ASA address fields when actually provided —
+      // passing `undefined` here makes algokit-utils throw while building
+      // the transaction.
+      ...(options.managerAddress ? { manager: Address.fromString(options.managerAddress) } : {}),
+      ...(options.reserveAddress ? { reserve: Address.fromString(options.reserveAddress) } : {}),
+      ...(options.freezeAddress ? { freeze: Address.fromString(options.freezeAddress) } : {}),
+      ...(options.clawbackAddress ? { clawback: Address.fromString(options.clawbackAddress) } : {}),
+    };
 
-    let params = paramsBuilder.get();
-    if (options.url) params.au = options.url;
+    const txnParams: TransactionParams = {
+      type: TransactionType.AssetConfig,
+      assetConfig: assetParams,
+      sender: Address.fromString(creatorAddress),
+      fee: BigInt(suggested_params.minFee),
+      firstValid: suggested_params.lastRound,
+      lastValid: suggested_params.lastRound + 1000n,
+      genesisHash: Uint8Array.from(Buffer.from(this.configService.get<string>('GENESIS_HASH'), 'base64')),
+      genesisId: this.configService.get<string>('GENESIS_ID'),
+    };
 
-    let transactionBuilder = crafter
-      .createAsset(creatorAddress, params)
-      .addFee(suggested_params.minFee)
-      .addFirstValidRound(suggested_params.lastRound)
-      .addLastValidRound(suggested_params.lastRound + 1000n);
-
-    return transactionBuilder.get().encode();
+    return encodeTransaction(new Transaction(txnParams));
   }
 
   async craftPaymentTx(
@@ -101,15 +141,23 @@ export class ChainService {
   ): Promise<Uint8Array> {
     suggested_params = suggested_params ? suggested_params : await this.getSuggestedParams();
 
-    let crafter = this.getCrafter();
+    const pay: PaymentTransactionFields = {
+      amount: BigInt(amount),
+      receiver: Address.fromString(to),
+    };
 
-    let transactionBuilder = crafter
-      .pay(amount, from, to)
-      .addFee(suggested_params.minFee)
-      .addFirstValidRound(suggested_params.lastRound)
-      .addLastValidRound(suggested_params.lastRound + 1000n);
+    const txnParams: TransactionParams = {
+      type: TransactionType.Payment,
+      payment: pay,
+      sender: Address.fromString(from),
+      fee: BigInt(suggested_params.minFee),
+      firstValid: suggested_params.lastRound,
+      lastValid: suggested_params.lastRound + 1000n,
+      genesisHash: Uint8Array.from(Buffer.from(this.configService.get<string>('GENESIS_HASH'), 'base64')),
+      genesisId: this.configService.get<string>('GENESIS_ID'),
+    };
 
-    return transactionBuilder.get().encode();
+    return encodeTransaction(new Transaction(txnParams));
   }
 
   async craftAssetTransferTx(
@@ -123,33 +171,26 @@ export class ChainService {
   ): Promise<Uint8Array> {
     suggested_params = suggested_params ? suggested_params : await this.getSuggestedParams();
 
-    let builder = new AssetTransferTxBuilder(
-      this.configService.get('GENESIS_ID'),
-      this.configService.get('GENESIS_HASH'),
-    );
-    builder.addAssetId(asset_id);
-    builder.addSender(from);
-    builder.addAssetReceiver(to);
-    builder.addFee(suggested_params.minFee);
-    builder.addFirstValidRound(suggested_params.lastRound);
-    builder.addLastValidRound(suggested_params.lastRound + 1000n);
-    if (note) {
-      builder.addNote(note);
-    }
-    
-    if (amount != 0) {
-      builder.addAssetAmount(amount);
-    }
+    const assetTransfer: AssetTransferTransactionFields = {
+      assetId: asset_id,
+      amount: BigInt(amount),
+      receiver: Address.fromString(to),
+    };
 
-    if (lease) {
-      try {
-        builder.addLease(this.parseLease(lease));
-      } catch (error) {
-        throw new HttpErrorByCode[400](`Invalid lease format: ${error.message}`);
-      }
-    }
+    const txnParams: TransactionParams = {
+      type: TransactionType.AssetTransfer,
+      assetTransfer: assetTransfer,
+      sender: Address.fromString(from),
+      fee: BigInt(suggested_params.minFee),
+      firstValid: suggested_params.lastRound,
+      lastValid: suggested_params.lastRound + 1000n,
+      genesisHash: Uint8Array.from(Buffer.from(this.configService.get<string>('GENESIS_HASH'), 'base64')),
+      genesisId: this.configService.get<string>('GENESIS_ID'),
+      note: note ? Uint8Array.from(Buffer.from(note)) : undefined,
+      lease: lease ? this.parseLease(lease) : undefined,
+    };
 
-    return builder.get().encode();
+    return encodeTransaction(new Transaction(txnParams));
   }
 
   async craftAssetClawbackTx(
@@ -164,35 +205,157 @@ export class ChainService {
   ): Promise<Uint8Array> {
     suggested_params = suggested_params ? suggested_params : await this.getSuggestedParams();
 
-    const builder = new AssetTransferTxBuilder(
-      this.configService.get('GENESIS_ID'),
-      this.configService.get('GENESIS_HASH'),
-    );
-    builder.addAssetId(asset_id);
-    builder.addSender(clawbackAddress);
-    builder.addAssetSender(from);
-    builder.addAssetReceiver(to);
-    builder.addFee(suggested_params.minFee);
-    builder.addFirstValidRound(suggested_params.lastRound);
-    builder.addLastValidRound(suggested_params.lastRound + 1000n);
+    const assetTransfer: AssetTransferTransactionFields = {
+      assetId: asset_id,
+      amount: BigInt(amount),
+      receiver: Address.fromString(to),
+      assetSender: Address.fromString(from),
+    };
 
-    if (note) {
-      builder.addNote(note);
+    const txnParams: TransactionParams = {
+      type: TransactionType.AssetTransfer,
+      assetTransfer: assetTransfer,
+      sender: Address.fromString(clawbackAddress),
+      fee: BigInt(suggested_params.minFee),
+      firstValid: suggested_params.lastRound,
+      lastValid: suggested_params.lastRound + 1000n,
+      genesisHash: Uint8Array.from(Buffer.from(this.configService.get<string>('GENESIS_HASH'), 'base64')),
+      genesisId: this.configService.get<string>('GENESIS_ID'),
+      note: note ? Uint8Array.from(Buffer.from(note)) : undefined,
+      lease: lease ? this.parseLease(lease) : undefined,
+    };
+
+    return encodeTransaction(new Transaction(txnParams));
+  }
+
+  async craftAppCallTx(
+    managerPublicAddress: string,
+    appCallRequestDto: AppCallRequestDto,
+    suggested_params: TruncatedSuggestedParamsResponse,
+    fee?: number,
+  ) {
+    const appCall: AppCallTransactionFields = {
+      appId: appCallRequestDto.appId ? BigInt(appCallRequestDto.appId) : 0n,
+      onComplete: appCallRequestDto.onComplete ?? 0,
+    };
+
+    if (appCallRequestDto.globalInts || appCallRequestDto.globalByteSlices) {
+      appCall.globalStateSchema = {
+        numUints: appCallRequestDto.globalInts ?? 0,
+        numByteSlices: appCallRequestDto.globalByteSlices ?? 0,
+      };
     }
 
-    if (amount != 0) {
-      builder.addAssetAmount(amount);
+    if (appCallRequestDto.localInts || appCallRequestDto.localByteSlices) {
+      appCall.localStateSchema = {
+        numUints: appCallRequestDto.localInts ?? 0,
+        numByteSlices: appCallRequestDto.localByteSlices ?? 0,
+      };
     }
 
-    if (lease) {
-      try {
-        builder.addLease(this.parseLease(lease));
-      } catch (error) {
-        throw new HttpErrorByCode[400](`Invalid lease format: ${error.message}`);
+    if (appCallRequestDto.foreignAssets?.length) {
+      appCall.assetReferences = appCallRequestDto.foreignAssets.map((a: any) => BigInt(a));
+    }
+    if (appCallRequestDto.foreignApps?.length) {
+      appCall.appReferences = appCallRequestDto.foreignApps.map((a: any) => BigInt(a));
+    }
+    if (appCallRequestDto.foreignAccounts?.length) {
+      appCall.accountReferences = appCallRequestDto.foreignAccounts.map((a) => Address.fromString(a));
+    }
+
+    if (appCallRequestDto.boxes?.length) {
+      appCall.boxReferences = appCallRequestDto.boxes.map((b) => ({
+        // `i` is the index into the foreign-apps array (0 = the called app
+        // itself). Default to 0 when callers omit it.
+        appId: b.i !== undefined && b.i !== null ? BigInt(b.i) : 0n,
+        name: new Uint8Array(Buffer.from(b.n, 'base64')),
+      }));
+    }
+
+    if (appCallRequestDto.approvalProgram) appCall.approvalProgram = base64ToBytes(appCallRequestDto.approvalProgram);
+    if (appCallRequestDto.clearProgram) appCall.clearStateProgram = base64ToBytes(appCallRequestDto.clearProgram);
+
+    const appArgs = await this.processAbiMethodArgs(appCallRequestDto.args);
+    if (appArgs.length > 0) appCall.args = appArgs;
+
+    const txnParams: TransactionParams = {
+      type: TransactionType.AppCall,
+      appCall: appCall,
+      sender: Address.fromString(managerPublicAddress),
+      fee: BigInt(fee ?? suggested_params.minFee),
+      firstValid: suggested_params.lastRound,
+      lastValid: suggested_params.lastRound + 1000n,
+      genesisHash: Uint8Array.from(Buffer.from(this.configService.get<string>('GENESIS_HASH'), 'base64')),
+      genesisId: this.configService.get<string>('GENESIS_ID'),
+      note: appCallRequestDto.note ? Uint8Array.from(Buffer.from(appCallRequestDto.note)) : undefined,
+      lease: appCallRequestDto.lease ? this.parseLease(appCallRequestDto.lease) : undefined,
+    };
+
+    return encodeTransaction(new Transaction(txnParams));
+  }
+
+  /**
+   * Build ABI method selector + encoded arguments array suitable for addApplicationArgs.
+   * It uses the ABI specification and embedded `value` fields from AppCallRequestDto.args.
+   * It currently supports uint64, string, and address. Txn-typed args are ignored here
+   * and must be represented as separate transactions in the group.
+   */
+  async processAbiMethodArgs(spec: AppCallRequestDto['args']): Promise<Uint8Array[]> {
+    if (!spec) {
+      return [];
+    }
+
+    const methodName = spec.name;
+    const argSpecs = Array.isArray(spec.args) ? spec.args : [];
+    const returnType = spec.returns?.type ?? 'void';
+
+    const argTypes: string[] = argSpecs.map((s: any) => s.type).filter((t: any): t is string => typeof t === 'string');
+
+    const signature = `${methodName}(${argTypes.join(',')})${returnType}`;
+
+    const selector = new Uint8Array(sha512_256.array(Buffer.from(signature)).slice(0, 4));
+
+    const encodedArgs: Uint8Array[] = [];
+
+    argSpecs.forEach((argSpec: any) => {
+      const type = argSpec.type as string;
+      const value = argSpec.value;
+
+      // For now we skip txn typed args here; they are expected to be
+      // separate transactions in the group, not ABI-encoded scalars.
+      if (type === 'pay' || type === 'keyreg' || type === 'axfer' || type === 'acfg' || type === 'appl') {
+        return;
       }
-    }
 
-    return builder.get().encode();
+      if (value === undefined || value === null) {
+        return;
+      }
+
+      const encoded = this.encodeAbiArgument(type, value);
+
+      if (encoded) {
+        encodedArgs.push(encoded);
+      }
+    });
+
+    return [selector, ...encodedArgs];
+  }
+
+  private encodeAbiArgument(type: string, value: any): Uint8Array | null {
+    switch (type) {
+      case 'uint64': {
+        return encodeUint64(BigInt(value));
+      }
+      case 'string': {
+        return encodeString(value);
+      }
+      case 'address': {
+        // decodeAddress returns the raw public key bytes for an address string
+        return new Address(value).publicKey;
+      }
+      default:
+        throw new Error(`Unsupported ABI argument type: ${type}`);
+    }
   }
 
   async makeAlgoNodeRequest(path: string, method: 'GET' | 'POST', data?: any): Promise<any> {
@@ -364,8 +527,8 @@ export class ChainService {
    * @returns - The transaction ID of the submitted transaction.
    */
   async submitTransaction(txnOrtxns: Uint8Array | Uint8Array[]): Promise<TruncatedPostTransactionsResponse> {
-    let data = txnOrtxns instanceof Uint8Array ? Buffer.from(txnOrtxns) : Buffer.concat(txnOrtxns);
-    let response = await this.makeAlgoNodeRequest('v2/transactions', 'POST', data);
+    const data = txnOrtxns instanceof Uint8Array ? Buffer.from(txnOrtxns) : Buffer.concat(txnOrtxns);
+    const response = await this.makeAlgoNodeRequest('v2/transactions', 'POST', data);
     const postTransactionResponse: TruncatedPostTransactionsResponse = {
       txid: response['txId'],
     };

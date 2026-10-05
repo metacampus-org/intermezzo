@@ -1,20 +1,39 @@
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import createMockInstance from 'jest-create-mock-instance';
 import { VaultService } from '../vault/vault.service';
-import { WalletService } from './wallet.service';
+import { UserAccount, WalletService } from './wallet.service';
 import { ChainService } from '../chain/chain.service';
+import { DidService } from '../did/did.service';
+import { Oid4vcAgentProvider } from '../oid4vc/agent/oid4vc-agent.provider';
 import { CreateAssetDto } from './create-asset.dto';
 import { ConfigService } from '@nestjs/config';
 import { HttpService } from '@nestjs/axios';
 import { ManagerDetailDto } from './manager-detail.dto';
 import { plainToClass } from 'class-transformer';
 import { randomBytes } from 'crypto';
-import { AlgorandEncoder } from '@algorandfoundation/algo-models';
+import { readFileSync } from 'fs';
+import { join } from 'path';
+import { Address } from '@algorandfoundation/algokit-utils';
+import { decodeTransaction, encodeSignedTransaction } from '@algorandfoundation/algokit-utils/transact';
+import * as algosdk from 'algosdk';
+import { ManagerVaultTokenProvider } from '../auth/manager-vault-token.provider';
+import { validate } from 'class-validator';
+import { CreateUserDto } from './create-user.dto';
+import {
+  TruncatedAccountAssetResponse,
+  TruncatedAccountResponse,
+  TruncatedSuggestedParamsResponse,
+} from 'src/chain/algo-node-responses';
 
 describe('WalletService', () => {
+  const pqVector = JSON.parse(readFileSync(join(__dirname, '../../vault/plugin/testdata/falcon1024.json'), 'utf8'));
   let walletService: WalletService;
   let vaultServiceMock: jest.Mocked<VaultService>;
   let chainServiceMock: jest.Mocked<ChainService>;
   let configServiceMock: jest.Mocked<ConfigService>;
+  let didServiceMock: jest.Mocked<DidService>;
+  let oid4vcAgentProviderMock: jest.Mocked<Oid4vcAgentProvider>;
+  let managerTokenProviderMock: jest.Mocked<ManagerVaultTokenProvider>;
 
   let chainService: ChainService;
   let httpService: HttpService;
@@ -23,7 +42,26 @@ describe('WalletService', () => {
     vaultServiceMock = createMockInstance(VaultService);
     chainServiceMock = createMockInstance(ChainService);
     configServiceMock = createMockInstance(ConfigService);
-    walletService = new WalletService(vaultServiceMock, chainServiceMock, configServiceMock);
+    didServiceMock = createMockInstance(DidService);
+    didServiceMock.publishControlledDid.mockResolvedValue({
+      did: 'did:algo:test:app:1:00',
+      document: {} as never,
+      txIds: [],
+    });
+    didServiceMock.deriveDid.mockReturnValue('did:algo:test:app:1:derived');
+    oid4vcAgentProviderMock = createMockInstance(Oid4vcAgentProvider);
+    managerTokenProviderMock = createMockInstance(ManagerVaultTokenProvider);
+    managerTokenProviderMock.getToken.mockResolvedValue('service_vault_token');
+    vaultServiceMock.canCreateUserKey.mockResolvedValue(true);
+    vaultServiceMock.kvCreate.mockResolvedValue(true);
+    walletService = new WalletService(
+      vaultServiceMock,
+      chainServiceMock,
+      configServiceMock,
+      didServiceMock,
+      oid4vcAgentProviderMock,
+      managerTokenProviderMock,
+    );
 
     httpService = createMockInstance(HttpService);
     chainService = new ChainService(configServiceMock, httpService);
@@ -31,7 +69,7 @@ describe('WalletService', () => {
     configServiceMock.get.mockImplementation((key: string) => {
       const config = {
         GENESIS_ID: 'test-genesis-id',
-        GENESIS_HASH: 'test-genesis-hash',
+        GENESIS_HASH: 'SGO1GKSzyE7IEPItTxCByw9x8FmnrCDexi9/cOUJOiI=',
         NODE_HTTP_SCHEME: 'http',
         NODE_HOST: 'localhost',
         NODE_PORT: '4001',
@@ -51,40 +89,71 @@ describe('WalletService', () => {
 
     vaultServiceMock.transitCreateKey.mockResolvedValueOnce(pubKey);
     chainServiceMock.getAccountBalance.mockResolvedValueOnce(0n);
-    
+
     const result = await walletService.userCreate(userId, 'vault_token');
 
-    // expect(vaultServiceMock.getUserPublicKey).toHaveBeenCalledWith(userId, 'vault_token');
-    // expect(chainServiceMock.getAccountBalance).toHaveBeenCalledWith(new AlgorandEncoder().encodeAddress(pubKey));
+    expect(vaultServiceMock.pqGetKey).toHaveBeenCalledWith(userId, 'service_vault_token');
+    expect(vaultServiceMock.transitCreateKey).toHaveBeenCalledWith(userId, undefined, 'vault_token');
     expect(result).toStrictEqual({
-      public_address: new AlgorandEncoder().encodeAddress(pubKey),
+      public_address: new Address(pubKey).toString(),
       user_id: userId,
       algoBalance: '0',
+      account_type: 'ed25519',
     });
-  })
+  });
+
+  it('rejects user IDs that can alias a Vault path', async () => {
+    const dto = Object.assign(new CreateUserDto(), { user_id: 'x/../foo' });
+    await expect(validate(dto)).resolves.toEqual(
+      expect.arrayContaining([expect.objectContaining({ property: 'user_id' })]),
+    );
+  });
 
   it('\(OK) getKeys()', async () => {
     const pubKey = randomBytes(32);
+    const pqPublicKey = Buffer.from(pqVector.publicKey, 'base64');
+    const pqAddress = pqVector.address;
     const userId = '123581253191824129481240513501928401928';
 
-    vaultServiceMock.getUserPublicKey.mockResolvedValueOnce(pubKey);
-    vaultServiceMock.getKeys.mockResolvedValueOnce([{
-      user_id: userId,
-      public_address: Buffer.from(pubKey).toString('base64'), // public_address here is actually publicKey from the vault
-    }]);
-
-    chainServiceMock.getAccountBalance.mockResolvedValueOnce(0n);
+    vaultServiceMock.getKeys.mockResolvedValueOnce([
+      {
+        user_id: userId,
+        public_address: pubKey.toString('base64'),
+      },
+    ]);
+    vaultServiceMock.pqListKeys.mockResolvedValueOnce(['pq-user']);
+    vaultServiceMock.pqGetKey.mockResolvedValueOnce(pqPublicKey);
 
     const result = await walletService.getKeys('vault_token');
-    expect(result).toStrictEqual([{
-      public_address: new AlgorandEncoder().encodeAddress(pubKey),
-      user_id: userId
-    }]);
-  })
+    expect(result).toStrictEqual([
+      {
+        public_address: new Address(pubKey).toString(),
+        user_id: userId,
+        account_type: 'ed25519',
+      },
+      {
+        public_address: pqAddress,
+        user_id: 'pq-user',
+        account_type: 'falcon1024',
+      },
+    ]);
+    expect(vaultServiceMock.getKeys).toHaveBeenCalledWith('vault_token');
+    expect(vaultServiceMock.pqListKeys).toHaveBeenCalledWith('service_vault_token');
+    expect(vaultServiceMock.pqGetKey).toHaveBeenCalledWith('pq-user', 'service_vault_token');
+  });
+
+  it('keeps the original transit LIST as the authorization gate', async () => {
+    vaultServiceMock.getKeys.mockRejectedValueOnce(new ForbiddenException());
+
+    await expect(walletService.getKeys('transit_only_token')).rejects.toThrow(ForbiddenException);
+
+    expect(managerTokenProviderMock.getToken).not.toHaveBeenCalled();
+    expect(vaultServiceMock.pqListKeys).not.toHaveBeenCalled();
+  });
 
   it('getUserInfo() test', async () => {
-    const pubKey = randomBytes(32)
-    const algoBalanceMock = 10n
+    const pubKey = randomBytes(32);
+    const algoBalanceMock = 10n;
 
     chainServiceMock.getAccountBalance.mockResolvedValueOnce(algoBalanceMock);
     vaultServiceMock.getUserPublicKey.mockResolvedValueOnce(pubKey);
@@ -96,15 +165,235 @@ describe('WalletService', () => {
       'vault_token',
     );
     expect(result).toStrictEqual({
-      public_address: new AlgorandEncoder().encodeAddress(pubKey),
+      public_address: new Address(pubKey).toString(),
       user_id: '123581253191824129481240513501928401928',
       algoBalance: algoBalanceMock.toString(),
+      account_type: 'ed25519',
+    });
+  });
+
+  describe('PQ accounts', () => {
+    const userId = 'pq-user';
+    const pqKey = Buffer.from(pqVector.publicKey, 'base64');
+    const pqAddress = { address: algosdk.Address.fromString(pqVector.address), salt: pqVector.salt };
+
+    /** How `VaultService.getUserPublicKey` reports a missing transit key. */
+    const transitMiss = () => vaultServiceMock.getUserPublicKey.mockRejectedValueOnce(new NotFoundException());
+
+    describe('userCreate', () => {
+      it('(OK) should create a PQ key and derive its address in Intermezzo', async () => {
+        vaultServiceMock.pqGetKey.mockResolvedValueOnce(undefined); // no conflict check needed...
+        transitMiss(); // ...for falcon1024 the guard probes transit
+        vaultServiceMock.pqCreateKey.mockResolvedValueOnce(pqKey);
+
+        const result = await walletService.userCreate(userId, 'vault_token', 'falcon1024');
+
+        expect(vaultServiceMock.pqCreateKey).toHaveBeenCalledWith(userId, 'vault_token');
+        expect(vaultServiceMock.transitCreateKey).not.toHaveBeenCalled();
+        expect(result).toStrictEqual({
+          user_id: userId,
+          public_address: pqAddress.address.toString(),
+          algoBalance: '0',
+          account_type: 'falcon1024',
+        });
+      });
+
+      it('(OK) should default to ed25519 when no account_type is given', async () => {
+        const pubKey = randomBytes(32);
+        vaultServiceMock.pqGetKey.mockResolvedValueOnce(undefined);
+        vaultServiceMock.transitCreateKey.mockResolvedValueOnce(pubKey);
+
+        const result = await walletService.userCreate(userId, 'vault_token');
+
+        expect(vaultServiceMock.pqGetKey).toHaveBeenCalledWith(userId, 'service_vault_token');
+        expect(vaultServiceMock.pqCreateKey).not.toHaveBeenCalled();
+        expect(result.account_type).toEqual('ed25519');
+        expect(result.public_address).toEqual(new Address(pubKey).toString());
+      });
+
+      it('(FAIL) should 409 when the user_id already exists as ed25519', async () => {
+        // The guard is the difference between a clear error and a
+        // user_id that resolves to two addresses depending on probe order.
+        vaultServiceMock.getUserPublicKey.mockResolvedValueOnce(randomBytes(32));
+
+        await expect(walletService.userCreate(userId, 'vault_token', 'falcon1024')).rejects.toThrow(ConflictException);
+        expect(vaultServiceMock.pqCreateKey).not.toHaveBeenCalled();
+      });
+
+      it('(FAIL) should 409 when the user_id already exists as falcon1024', async () => {
+        vaultServiceMock.pqGetKey.mockResolvedValueOnce(pqKey);
+
+        await expect(walletService.userCreate(userId, 'vault_token', 'ed25519')).rejects.toThrow(ConflictException);
+        expect(vaultServiceMock.transitCreateKey).not.toHaveBeenCalled();
+      });
+
+      it('does not reserve an ID when the caller cannot create the target key', async () => {
+        vaultServiceMock.canCreateUserKey.mockResolvedValueOnce(false);
+
+        await expect(walletService.userCreate(userId, 'denied-token', 'falcon1024')).rejects.toThrow(
+          ForbiddenException,
+        );
+        expect(managerTokenProviderMock.getToken).not.toHaveBeenCalled();
+        expect(vaultServiceMock.kvCreate).not.toHaveBeenCalled();
+        expect(vaultServiceMock.pqCreateKey).not.toHaveBeenCalled();
+      });
+
+      it('atomically admits one type across service instances', async () => {
+        const other = new WalletService(
+          vaultServiceMock,
+          chainServiceMock,
+          configServiceMock,
+          didServiceMock,
+          oid4vcAgentProviderMock,
+          managerTokenProviderMock,
+        );
+        let claim: Record<string, unknown> | undefined;
+        vaultServiceMock.getUserPublicKey.mockRejectedValue(new NotFoundException());
+        vaultServiceMock.pqGetKey.mockResolvedValue(undefined);
+        vaultServiceMock.kvCreate.mockImplementation(async (_path, data) => {
+          if (claim) return false;
+          claim = data;
+          return true;
+        });
+        vaultServiceMock.kvRead.mockImplementation(async () => claim);
+        vaultServiceMock.transitCreateKey.mockResolvedValue(randomBytes(32));
+        vaultServiceMock.pqCreateKey.mockResolvedValue(pqKey);
+
+        const results = await Promise.allSettled([
+          walletService.userCreate(userId, 'vault_token', 'ed25519'),
+          other.userCreate(userId, 'vault_token', 'falcon1024'),
+        ]);
+
+        expect(results.filter((result) => result.status === 'fulfilled')).toHaveLength(1);
+        expect(results.filter((result) => result.status === 'rejected')).toEqual([
+          expect.objectContaining({ reason: expect.any(ConflictException) }),
+        ]);
+        expect(
+          vaultServiceMock.transitCreateKey.mock.calls.length + vaultServiceMock.pqCreateKey.mock.calls.length,
+        ).toBe(1);
+      });
+
+      it('retries the same type after key provisioning fails', async () => {
+        const claim = { schemaVersion: 1, userId, accountType: 'ed25519' } as const;
+        vaultServiceMock.pqGetKey.mockResolvedValue(undefined);
+        vaultServiceMock.kvCreate.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+        vaultServiceMock.kvRead.mockResolvedValue(claim);
+        vaultServiceMock.transitCreateKey.mockRejectedValueOnce(new Error('provisioning failed'));
+
+        await expect(walletService.userCreate(userId, 'vault_token')).rejects.toThrow('provisioning failed');
+
+        const publicKey = randomBytes(32);
+        vaultServiceMock.transitCreateKey.mockResolvedValueOnce(publicKey);
+        await expect(walletService.userCreate(userId, 'vault_token')).resolves.toMatchObject({
+          user_id: userId,
+          account_type: 'ed25519',
+          public_address: new Address(publicKey).toString(),
+        });
+      });
+
+      it('rejects case variants that share a normalized claim key', async () => {
+        vaultServiceMock.pqGetKey.mockResolvedValue(undefined);
+        vaultServiceMock.kvCreate.mockResolvedValueOnce(false);
+        vaultServiceMock.kvRead.mockResolvedValueOnce({ schemaVersion: 1, userId: 'PQ-User', accountType: 'ed25519' });
+
+        await expect(walletService.userCreate('pq-user', 'vault_token')).rejects.toThrow(ConflictException);
+        expect(vaultServiceMock.transitCreateKey).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('resolveUserAccount', () => {
+      it('(OK) should resolve an ed25519 account without touching the PQ mount', async () => {
+        const pubKey = randomBytes(32);
+        vaultServiceMock.getUserPublicKey.mockResolvedValueOnce(pubKey);
+
+        const account = await walletService.resolveUserAccount('ed-user', 'vault_token');
+
+        expect(account).toStrictEqual({
+          type: 'ed25519',
+          userId: 'ed-user',
+          address: new Address(pubKey).toString(),
+          publicKey: pubKey,
+        });
+        // Existing accounts must not pay for the new code path.
+        expect(vaultServiceMock.pqGetKey).not.toHaveBeenCalled();
+      });
+
+      it('(OK) should fall through to the PQ mount on a transit miss', async () => {
+        transitMiss();
+        vaultServiceMock.pqGetKey.mockResolvedValueOnce(pqKey);
+
+        const account = await walletService.resolveUserAccount(userId, 'vault_token');
+
+        expect(vaultServiceMock.pqGetKey).toHaveBeenCalledWith(userId, 'service_vault_token');
+        expect(account).toStrictEqual({
+          type: 'falcon1024',
+          userId,
+          address: pqAddress.address.toString(),
+          publicKey: pqKey,
+          salt: pqAddress.salt,
+          scheme: 'f1',
+        });
+      });
+
+      it('(FAIL) should 404 when neither mount holds the user', async () => {
+        transitMiss();
+        vaultServiceMock.pqGetKey.mockResolvedValueOnce(undefined);
+
+        await expect(walletService.resolveUserAccount('ghost', 'vault_token')).rejects.toThrow(NotFoundException);
+        expect(vaultServiceMock.pqGetKey).toHaveBeenCalledWith('ghost', 'service_vault_token');
+      });
+
+      it('(FAIL) should propagate a non-404 transit error rather than probing PQ', async () => {
+        // A 403 means "cannot tell", not "not an ed25519 account" —
+        // falling through would silently create the wrong answer.
+        vaultServiceMock.getUserPublicKey.mockRejectedValueOnce(new ForbiddenException());
+
+        await expect(walletService.resolveUserAccount(userId, 'vault_token')).rejects.toThrow(ForbiddenException);
+        expect(vaultServiceMock.pqGetKey).not.toHaveBeenCalled();
+        expect(managerTokenProviderMock.getToken).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('signTxAsUser compatibility', () => {
+      it('preserves signing for tokens without key-read permission', async () => {
+        const unsigned = new Uint8Array([1, 2, 3]);
+        const signed = new Uint8Array([4, 5, 6]);
+        const rawSignature = Buffer.alloc(64, 9);
+        vaultServiceMock.getUserPublicKey.mockRejectedValueOnce(new ForbiddenException());
+        vaultServiceMock.signAsUser.mockResolvedValueOnce(Buffer.from(`vault:v1:${rawSignature.toString('base64')}`));
+        chainServiceMock.addSignatureToTxn.mockReturnValueOnce(signed);
+
+        await expect(walletService.signTxAsUser(userId, unsigned, 'transit_only_token')).resolves.toBe(signed);
+
+        expect(vaultServiceMock.getUserPublicKey).not.toHaveBeenCalled();
+        expect(vaultServiceMock.signAsUser).toHaveBeenCalledWith(userId, unsigned, 'transit_only_token');
+        expect(vaultServiceMock.pqGetKey).not.toHaveBeenCalled();
+        expect(managerTokenProviderMock.getToken).not.toHaveBeenCalled();
+      });
+    });
+
+    describe('getUserInfo', () => {
+      it('(OK) should report a PQ account with its Intermezzo-derived address', async () => {
+        transitMiss();
+        vaultServiceMock.pqGetKey.mockResolvedValueOnce(pqKey);
+        chainServiceMock.getAccountBalance.mockResolvedValueOnce(42n);
+
+        const result = await walletService.getUserInfo(userId, 'vault_token');
+
+        expect(chainServiceMock.getAccountBalance).toHaveBeenCalledWith(pqAddress.address.toString());
+        expect(result).toStrictEqual({
+          user_id: userId,
+          public_address: pqAddress.address.toString(),
+          algoBalance: '42',
+          account_type: 'falcon1024',
+        });
+      });
     });
   });
 
   it('getManagerInfo() test', async () => {
-    const pubKey = randomBytes(32)
-    const algoBalanceMock = 10n
+    const pubKey = randomBytes(32);
+    const algoBalanceMock = 10n;
 
     chainServiceMock.getAccountBalance.mockResolvedValueOnce(algoBalanceMock);
     chainServiceMock.getAccountAssetHoldings.mockResolvedValueOnce([]);
@@ -115,18 +404,19 @@ describe('WalletService', () => {
 
     expect(vaultServiceMock.getManagerPublicKey).toHaveBeenCalledWith('vault_token');
 
-    expect(result).toStrictEqual(plainToClass(ManagerDetailDto, {
-      public_address: new AlgorandEncoder().encodeAddress(pubKey),
-      algoBalance: algoBalanceMock.toString(),
-      assets: [],
-    }))
+    expect(result).toStrictEqual(
+      plainToClass(ManagerDetailDto, {
+        public_address: new Address(pubKey).toString(),
+        algoBalance: algoBalanceMock.toString(),
+        assets: [],
+      }),
+    );
   });
 
-
   it('\(OK) createAsset()', async () => {
-    const pubKey = randomBytes(32)
+    const pubKey = randomBytes(32);
 
-    const address = new AlgorandEncoder().encodeAddress(pubKey);
+    const address = new Address(pubKey).toString();
 
     const createAssetDto: CreateAssetDto = {
       total: 5,
@@ -154,7 +444,7 @@ describe('WalletService', () => {
     chainServiceMock.submitTransaction.mockResolvedValueOnce({ txid: transactionId } as any);
 
     const result = await walletService.createAsset(createAssetDto, vaultToken);
-    
+
     expect(vaultServiceMock.getManagerPublicKey).toHaveBeenCalledWith(vaultToken);
     expect(chainServiceMock.craftAssetCreateTx).toHaveBeenCalledWith(address, createAssetDto);
     expect(vaultServiceMock.signAsManager).toHaveBeenCalledWith(tx, vaultToken);
@@ -164,17 +454,17 @@ describe('WalletService', () => {
   });
 
   describe('transferAsset()', () => {
-    const userPubKey = randomBytes(32)
-    const managerPubKey = randomBytes(32)
+    const userPubKey = randomBytes(32);
+    const managerPubKey = randomBytes(32);
 
     const assetId = 1n;
     const userId = 'user123';
     const amount = 10;
     const lease = randomBytes(32).toString('base64');
-    const note = "Note to self: notes are recorded for all";
+    const note = 'Note to self: notes are recorded for all';
     const vaultToken = 'vault_token';
-    const userPublicAddress = new AlgorandEncoder().encodeAddress(userPubKey);
-    const managerPublicAddress = new AlgorandEncoder().encodeAddress(managerPubKey);
+    const userPublicAddress = new Address(userPubKey).toString();
+    const managerPublicAddress = new Address(managerPubKey).toString();
     const suggestedParams = {
       minFee: 1000,
       lastRound: 1n,
@@ -335,7 +625,7 @@ describe('WalletService', () => {
         amount: 220000n,
         minBalance: 200000n,
       } as TruncatedAccountResponse);
-      const algoBalance = 2200000n
+      const algoBalance = 2200000n;
 
       // Mock the getAccountBalance to return a balance
       chainServiceMock.getAccountBalance.mockResolvedValueOnce(algoBalance);
@@ -377,8 +667,8 @@ describe('WalletService', () => {
         amount: 220000n,
         minBalance: 200000n,
       } as TruncatedAccountResponse);
-      
-      const algoBalance = 2200000n
+
+      const algoBalance = 2200000n;
 
       // Mock the getAccountBalance to return a balance
       chainServiceMock.getAccountBalance.mockResolvedValueOnce(algoBalance);
@@ -421,7 +711,7 @@ describe('WalletService', () => {
         minBalance: 100000n,
       } as TruncatedAccountResponse);
 
-      const algoBalance = 2200000n
+      const algoBalance = 2200000n;
 
       // Mock the getAccountBalance to return a balance
       chainServiceMock.getAccountBalance.mockResolvedValueOnce(algoBalance);
@@ -475,12 +765,10 @@ describe('WalletService', () => {
     const userId = 'user123';
     const amount = 10;
     const lease = randomBytes(32).toString('base64');
-    const note = "Note to self: notes are recorded for all";
+    const note = 'Note to self: notes are recorded for all';
     const vaultToken = 'vault_token';
-    const userPublicAddress = new AlgorandEncoder().encodeAddress(userPubKey);
-    const managerPublicAddress = new AlgorandEncoder().encodeAddress(
-      managerPubKey,
-    );
+    const userPublicAddress = new Address(userPubKey).toString();
+    const managerPublicAddress = new Address(managerPubKey).toString();
     const suggestedParams = {
       minFee: 1000,
       lastRound: 1n,
@@ -490,9 +778,7 @@ describe('WalletService', () => {
     const dummySignedManagerTx2 = new Uint8Array([6]);
 
     beforeEach(async () => {
-      chainServiceMock.getSuggestedParams.mockResolvedValueOnce(
-        suggestedParams,
-      );
+      chainServiceMock.getSuggestedParams.mockResolvedValueOnce(suggestedParams);
       chainServiceMock.submitTransaction.mockResolvedValueOnce({
         txid: 'final_tx_id',
       } as any);
@@ -500,15 +786,10 @@ describe('WalletService', () => {
       vaultServiceMock.getManagerPublicKey.mockResolvedValueOnce(managerPubKey);
 
       // not mock tx creation, and set group id functions
-      chainServiceMock.craftAssetTransferTx.mockImplementation((...args) =>
-        chainService.craftAssetTransferTx(...args),
-      );
-      chainServiceMock.craftPaymentTx.mockImplementation((...args) =>
-        chainService.craftPaymentTx(...args),
-      );
-      chainServiceMock.setGroupID.mockImplementation((...args) =>
-        chainService.setGroupID(...args),
-      );
+      chainServiceMock.craftAssetClawbackTx.mockImplementation((...args) => chainService.craftAssetClawbackTx(...args));
+      chainServiceMock.craftAssetTransferTx.mockImplementation((...args) => chainService.craftAssetTransferTx(...args));
+      chainServiceMock.craftPaymentTx.mockImplementation((...args) => chainService.craftPaymentTx(...args));
+      chainServiceMock.setGroupID.mockImplementation((...args) => chainService.setGroupID(...args));
 
       chainServiceMock.getAccountBalance.mockResolvedValueOnce(1000000n); // Mock default balance
 
@@ -517,32 +798,18 @@ describe('WalletService', () => {
         .fn()
         .mockResolvedValueOnce(dummySignedManagerTx1)
         .mockResolvedValueOnce(dummySignedManagerTx2);
-      walletService.signTxAsUser = jest
-        .fn()
-        .mockResolvedValueOnce(dummySignedUserTx);
+      walletService.signTxAsUser = jest.fn().mockResolvedValueOnce(dummySignedUserTx);
     });
     afterEach(() => {
       jest.clearAllMocks();
     });
     it('clawbackAsset() -- test clawback', async () => {
       // Call
-      const result = await walletService.clawbackAsset(
-        vaultToken,
-        assetId,
-        userId,
-        amount,
-        lease,
-        note,
-      );
+      const result = await walletService.clawbackAsset(vaultToken, assetId, userId, amount, lease, note);
 
       // Verify the flow.
-      expect(vaultServiceMock.getUserPublicKey).toHaveBeenCalledWith(
-        userId,
-        vaultToken,
-      );
-      expect(vaultServiceMock.getManagerPublicKey).toHaveBeenCalledWith(
-        vaultToken,
-      );
+      expect(vaultServiceMock.getUserPublicKey).toHaveBeenCalledWith(userId, vaultToken);
+      expect(vaultServiceMock.getManagerPublicKey).toHaveBeenCalledWith(vaultToken);
       expect(chainServiceMock.getSuggestedParams).toHaveBeenCalled();
 
       expect(chainServiceMock.craftAssetClawbackTx).toHaveBeenNthCalledWith(
@@ -559,11 +826,335 @@ describe('WalletService', () => {
 
       expect(walletService.signTxAsManager).toHaveBeenCalledTimes(1);
 
-      expect(chainServiceMock.submitTransaction).toHaveBeenCalledWith(
-        dummySignedManagerTx1,
-      );
+      expect(chainServiceMock.submitTransaction).toHaveBeenCalledWith(dummySignedManagerTx1);
 
       expect(result).toBe('final_tx_id');
+    });
+  });
+
+  describe('appCall()', () => {
+    const managerPubKey = randomBytes(32);
+    const userPubKey = randomBytes(32);
+    const managerPublicAddress = new Address(managerPubKey).toString();
+    const userPublicAddress = new Address(userPubKey).toString();
+    const vaultToken = 'vault_token';
+    const suggestedParams = { minFee: 1000, lastRound: 1n } as TruncatedSuggestedParamsResponse;
+    let dummyAppTx: Uint8Array;
+    const dummySignedTx = new Uint8Array([20, 21, 22]);
+
+    beforeEach(() => {
+      chainServiceMock.getSuggestedParams.mockResolvedValueOnce(suggestedParams);
+      chainServiceMock.craftAppCallTx.mockImplementation(async (...args) => {
+        dummyAppTx = await chainService.craftAppCallTx(...args);
+        return dummyAppTx;
+      });
+      chainServiceMock.submitTransaction.mockResolvedValueOnce({ txid: 'appcall_tx_id' } as any);
+      walletService.signTxAsManager = jest.fn().mockResolvedValueOnce(dummySignedTx);
+      walletService.signTxAsUser = jest.fn().mockResolvedValueOnce(dummySignedTx);
+    });
+
+    afterEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('appCall() -- as manager', async () => {
+      vaultServiceMock.getManagerPublicKey.mockResolvedValueOnce(managerPubKey);
+
+      const dto = { fromUserId: 'manager', appId: 123, onComplete: 0 } as any;
+      const result = await walletService.appCall(vaultToken, dto);
+
+      expect(vaultServiceMock.getManagerPublicKey).toHaveBeenCalledWith(vaultToken);
+      expect(chainServiceMock.getSuggestedParams).toHaveBeenCalled();
+      expect(chainServiceMock.craftAppCallTx).toHaveBeenCalledWith(
+        managerPublicAddress,
+        dto,
+        suggestedParams,
+        undefined,
+      );
+      expect(walletService.signTxAsManager).toHaveBeenCalledWith(dummyAppTx, vaultToken);
+      expect(chainServiceMock.submitTransaction).toHaveBeenCalledWith(dummySignedTx);
+      expect(result).toBe('appcall_tx_id');
+    });
+
+    it('appCall() -- as user', async () => {
+      vaultServiceMock.getUserPublicKey.mockResolvedValueOnce(userPubKey);
+      chainServiceMock.getAccountBalance.mockResolvedValueOnce(1000000n);
+
+      const userId = 'user123';
+      const dto = { fromUserId: userId, appId: 123, onComplete: 0 } as any;
+      const result = await walletService.appCall(vaultToken, dto);
+
+      expect(chainServiceMock.craftAppCallTx).toHaveBeenCalledWith(userPublicAddress, dto, suggestedParams, undefined);
+      expect(walletService.signTxAsUser).toHaveBeenCalledWith(
+        { type: 'ed25519', userId, address: userPublicAddress, publicKey: userPubKey },
+        dummyAppTx,
+        vaultToken,
+      );
+      expect(chainServiceMock.submitTransaction).toHaveBeenCalledWith(dummySignedTx);
+      expect(result).toBe('appcall_tx_id');
+    });
+
+    it('appCall() -- with fee override', async () => {
+      vaultServiceMock.getManagerPublicKey.mockResolvedValueOnce(managerPubKey);
+
+      const dto = { fromUserId: 'manager', appId: 123, onComplete: 0, fee: 2000 } as any;
+      await walletService.appCall(vaultToken, dto);
+
+      expect(chainServiceMock.craftAppCallTx).toHaveBeenCalledWith(managerPublicAddress, dto, suggestedParams, 2000);
+    });
+  });
+
+  describe('groupTransaction()', () => {
+    const managerPubKey = randomBytes(32);
+    const userPubKey = randomBytes(32);
+    const managerPublicAddress = new Address(managerPubKey).toString();
+    const userPublicAddress = new Address(userPubKey).toString();
+    const vaultToken = 'vault_token';
+    const suggestedParams = { minFee: 1000, lastRound: 1n } as TruncatedSuggestedParamsResponse;
+    const dummyTx1 = new Uint8Array([1, 2, 3]);
+    const dummyTx2 = new Uint8Array([4, 5, 6]);
+    const dummyGroupedTx1 = new Uint8Array([7, 8, 9]);
+    const dummyGroupedTx2 = new Uint8Array([10, 11, 12]);
+    const dummySignedManagerTx = new Uint8Array([20]);
+    const dummySignedUserTx = new Uint8Array([21]);
+
+    beforeEach(() => {
+      vaultServiceMock.getManagerPublicKey.mockResolvedValue(managerPubKey);
+      chainServiceMock.getSuggestedParams.mockResolvedValue(suggestedParams);
+      chainServiceMock.submitTransaction.mockResolvedValue({ txid: 'group_tx_id' } as any);
+      walletService.signTxAsManager = jest.fn().mockResolvedValue(dummySignedManagerTx);
+      walletService.signTxAsUser = jest.fn().mockResolvedValue(dummySignedUserTx);
+    });
+
+    afterEach(() => {
+      jest.clearAllMocks();
+    });
+
+    it('groupTransaction() -- throws if transactions is empty', async () => {
+      await expect(walletService.groupTransaction(vaultToken, { transactions: [] } as any)).rejects.toThrow(
+        'transactions is required and must be a non-empty array',
+      );
+    });
+
+    it('groupTransaction() -- throws on unsupported transaction type', async () => {
+      chainServiceMock.setGroupID.mockReturnValueOnce([dummyGroupedTx1]);
+
+      await expect(
+        walletService.groupTransaction(vaultToken, {
+          transactions: [{ type: 'unknown', payload: {} }],
+        } as any),
+      ).rejects.toThrow('Unsupported transaction type: unknown');
+    });
+
+    it('groupTransaction() -- payment + appCall as manager', async () => {
+      chainServiceMock.craftPaymentTx.mockResolvedValueOnce(dummyTx1);
+      chainServiceMock.craftAppCallTx.mockResolvedValueOnce(dummyTx2);
+      chainServiceMock.setGroupID.mockReturnValueOnce([dummyGroupedTx1, dummyGroupedTx2]);
+
+      // Mock decodeTransaction to return manager sender for both grouped txs
+      const managerSndAddress = Address.fromString(managerPublicAddress);
+      jest
+        // eslint-disable-next-line @typescript-eslint/no-require-imports
+        .spyOn(require('@algorandfoundation/algokit-utils/transact'), 'decodeTransaction')
+        .mockReturnValue({ sender: managerSndAddress } as any);
+
+      const groupRequestDto = {
+        transactions: [
+          { type: 'payment', payload: { fromUserId: 'manager', toAddress: userPublicAddress, amount: 1000 } },
+          { type: 'appCall', payload: { fromUserId: 'manager', appId: 123, onComplete: 0 } },
+        ],
+      } as any;
+
+      const result = await walletService.groupTransaction(vaultToken, groupRequestDto);
+
+      expect(chainServiceMock.craftPaymentTx).toHaveBeenCalledWith(
+        managerPublicAddress,
+        userPublicAddress,
+        1000,
+        suggestedParams,
+      );
+      expect(chainServiceMock.craftAppCallTx).toHaveBeenCalledWith(
+        managerPublicAddress,
+        groupRequestDto.transactions[1].payload,
+        suggestedParams,
+        undefined,
+      );
+      expect(result).toBe('group_tx_id');
+
+      jest.restoreAllMocks();
+    });
+
+    it('groupTransaction() -- throws if no transactions after processing', async () => {
+      await expect(walletService.groupTransaction(vaultToken, { transactions: [] } as any)).rejects.toThrow(
+        'transactions is required and must be a non-empty array',
+      );
+    });
+  });
+
+  describe('PQ signing and submission', () => {
+    const token = 'vault_token';
+    const managerKey = Buffer.alloc(32, 1);
+    const managerAddress = new Address(managerKey).toString();
+    const edKey = Buffer.alloc(32, 2);
+    const edAccount: UserAccount = {
+      type: 'ed25519',
+      userId: 'ed-user',
+      address: new Address(edKey).toString(),
+      publicKey: edKey,
+    };
+    const pqPublicKey = Buffer.from(pqVector.publicKey, 'base64');
+    const pqAddress = { address: algosdk.Address.fromString(pqVector.address), salt: pqVector.salt };
+    const pqAccount: UserAccount = {
+      type: 'falcon1024',
+      userId: 'pq-user',
+      address: pqAddress.address.toString(),
+      publicKey: pqPublicKey,
+      scheme: 'f1',
+      salt: pqAddress.salt,
+    };
+    const edSignature = Buffer.alloc(64, 8);
+    const pqSignature = Buffer.alloc(1226, 9);
+    const params = { minFee: 1000, lastRound: 1n };
+
+    beforeEach(() => {
+      vaultServiceMock.getManagerPublicKey.mockResolvedValue(managerKey);
+      vaultServiceMock.getUserPublicKey.mockImplementation(async (userId) => {
+        if (userId === edAccount.userId) return edKey;
+        throw new NotFoundException();
+      });
+      vaultServiceMock.pqGetKey.mockResolvedValue(pqPublicKey);
+      vaultServiceMock.signAsUser.mockResolvedValue(Buffer.from(`vault:v1:${edSignature.toString('base64')}`));
+      vaultServiceMock.signAsManager.mockResolvedValue(Buffer.from(`vault:v1:${edSignature.toString('base64')}`));
+      vaultServiceMock.pqSign.mockResolvedValue(pqSignature);
+      chainServiceMock.getSuggestedParams.mockResolvedValue(params);
+      chainServiceMock.craftPaymentTx.mockImplementation((...args) => chainService.craftPaymentTx(...args));
+      chainServiceMock.craftAppCallTx.mockImplementation((...args) => chainService.craftAppCallTx(...args));
+      chainServiceMock.craftAssetTransferTx.mockImplementation((...args) => chainService.craftAssetTransferTx(...args));
+      chainServiceMock.addSignatureToTxn.mockImplementation((...args) => chainService.addSignatureToTxn(...args));
+      chainServiceMock.addPqSignatureToTxn.mockImplementation((...args) => chainService.addPqSignatureToTxn(...args));
+      chainServiceMock.addPqFeeSurcharge.mockImplementation((...args) => chainService.addPqFeeSurcharge(...args));
+      chainServiceMock.setGroupID.mockImplementation((...args) => chainService.setGroupID(...args));
+      chainServiceMock.submitTransaction.mockResolvedValue({ txid: 'tx-id' });
+    });
+
+    const submitted = () => chainServiceMock.submitTransaction.mock.calls[0][0];
+
+    it('signs a PQ payment once, with the surcharge already included', async () => {
+      expect(await walletService.transferAlgoToAddress(token, pqAccount.userId, managerAddress, 5)).toBe('tx-id');
+      const signed = algosdk.decodeSignedTransaction(submitted() as Uint8Array);
+      expect(signed.txn.fee).toBe(3000n);
+      expect(signed.txn.group).toBeUndefined();
+      expect(signed.pqsig!.slt).toBe(pqVector.salt);
+      expect(Buffer.from(signed.pqsig!.pk)).toEqual(pqPublicKey);
+      expect(algosdk.addressFromPQSig(signed.pqsig!).toString()).toBe(pqAccount.address);
+      expect(vaultServiceMock.pqSign).toHaveBeenCalledWith(pqAccount.userId, signed.txn.bytesToSign(), token);
+      expect(vaultServiceMock.pqSign).toHaveBeenCalledTimes(1);
+      expect(vaultServiceMock.pqGetKey).toHaveBeenCalledTimes(1);
+      expect(vaultServiceMock.signAsUser).not.toHaveBeenCalled();
+      expect(chainServiceMock.setGroupID).not.toHaveBeenCalled();
+    });
+
+    it.each(['ed-user', 'manager'])('preserves legacy single-payment bytes for %s', async (userId) => {
+      const address = userId === 'manager' ? managerAddress : edAccount.address;
+      const original = await chainService.craftPaymentTx(address, managerAddress, 5, params);
+      const expected = encodeSignedTransaction({ txn: decodeTransaction(original), sig: edSignature });
+      await walletService.transferAlgoToAddress(token, userId, managerAddress, 5);
+      expect(submitted()).toEqual(expected);
+      expect(chainServiceMock.addPqFeeSurcharge).not.toHaveBeenCalled();
+      expect(vaultServiceMock.pqSign).not.toHaveBeenCalled();
+    });
+
+    it('preserves legacy ed25519 group bytes', async () => {
+      const original = await Promise.all(
+        [5, 6].map((amount) => chainService.craftPaymentTx(edAccount.address, managerAddress, amount, params)),
+      );
+      const expected = chainService
+        .setGroupID(original)
+        .map((tx) => encodeSignedTransaction({ txn: decodeTransaction(tx), sig: edSignature }));
+      await walletService.groupTransaction(token, {
+        transactions: [5, 6].map((amount) => ({
+          type: 'payment',
+          payload: { fromUserId: edAccount.userId, toAddress: managerAddress, amount },
+        })),
+      });
+      expect(submitted()).toEqual(expected);
+      expect(vaultServiceMock.getUserPublicKey).toHaveBeenCalledTimes(1);
+    });
+
+    it('surcharges only PQ senders before grouping and reuses account resolution', async () => {
+      await walletService.groupTransaction(token, {
+        transactions: [pqAccount, edAccount, pqAccount].map((account, index) => ({
+          type: 'payment',
+          payload: { fromUserId: account.userId, toAddress: managerAddress, amount: index + 1 },
+        })),
+      });
+      const signed = (submitted() as Uint8Array[]).map(algosdk.decodeSignedTransaction);
+      expect(signed.map((entry) => entry.txn.fee)).toEqual([3000n, 1000n, 3000n]);
+      expect(signed[0].pqsig).toBeDefined();
+      expect(signed[1].pqsig).toBeUndefined();
+      expect(Buffer.from(signed[1].sig!)).toEqual(edSignature);
+      const adjusted = chainServiceMock.setGroupID.mock.calls[0][0];
+      expect(adjusted.map((tx) => decodeTransaction(tx).fee)).toEqual([3000n, 1000n, 3000n]);
+      const expectedGroup = decodeTransaction(chainService.setGroupID(adjusted)[0]).group;
+      for (const entry of signed) expect(entry.txn.group).toEqual(expectedGroup);
+      expect(vaultServiceMock.pqGetKey).toHaveBeenCalledTimes(1);
+      expect(vaultServiceMock.getUserPublicKey).toHaveBeenCalledTimes(2);
+    });
+
+    it('adds to an explicit pooled app-call fee', async () => {
+      await walletService.appCall(token, { fromUserId: pqAccount.userId, appId: 123, fee: 5000 } as any);
+      expect(algosdk.decodeSignedTransaction(submitted() as Uint8Array).txn.fee).toBe(7000n);
+      expect(vaultServiceMock.pqSign).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([edAccount, pqAccount])('prefunds an underfunded $type asset opt-in', async (account) => {
+      chainServiceMock.getAccountAsset.mockResolvedValue(null);
+      chainServiceMock.getAccountDetail.mockResolvedValue({ amount: 0n, minBalance: 100000n, assets: [] });
+      await walletService.transferAsset(token, 1n, account.userId, 10);
+      const fee = account.type === 'falcon1024' ? 3000 : 1000;
+      expect(chainServiceMock.craftPaymentTx).toHaveBeenCalledWith(
+        managerAddress,
+        account.address,
+        200000 + fee,
+        params,
+      );
+      const signed = (submitted() as Uint8Array[]).map(algosdk.decodeSignedTransaction);
+      expect(signed.map((entry) => entry.txn.fee)).toEqual([1000n, BigInt(fee), 1000n]);
+      expect(signed[1].txn.sender.toString()).toBe(account.address);
+    });
+
+    it('does not submit when PQ signing fails', async () => {
+      vaultServiceMock.pqSign.mockRejectedValue(new ForbiddenException());
+      await expect(walletService.transferAlgoToAddress(token, pqAccount.userId, managerAddress, 5)).rejects.toThrow();
+      expect(chainServiceMock.submitTransaction).not.toHaveBeenCalled();
+      expect(vaultServiceMock.signAsUser).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deployManagerIdentity()', () => {
+    it('maps algod overspend errors to UnprocessableEntityException with a friendly message', async () => {
+      const overspendMessage =
+        'Error resolving execution info via simulate in transaction 0: ' +
+        'transaction CWNRIIDBLS22ZUFNQPM7Y7PFOTLF4B75PUZ4L53T4KCWICJF66HQ: ' +
+        'overspend (account 3E6ZXNHDFE4FJCLUKNUOHFUGHHOHA7N2QNFVU2HH7FUSQUAGPITQLCGB5E, ' +
+        'tried to spend {1000})';
+      didServiceMock.deployStorage.mockRejectedValueOnce(new Error(overspendMessage));
+
+      await expect(walletService.deployManagerIdentity('vault_token')).rejects.toMatchObject({
+        status: 422,
+        message: expect.stringContaining('Manager account is underfunded'),
+      });
+
+      expect(didServiceMock.deployStorage).toHaveBeenCalledWith('vault_token', { force: undefined });
+      expect(oid4vcAgentProviderMock.resetCachedIssuerDid).not.toHaveBeenCalled();
+      expect(oid4vcAgentProviderMock.ensureIssuerDid).not.toHaveBeenCalled();
+    });
+
+    it('rethrows non-overspend errors unchanged', async () => {
+      const other = new Error('something else exploded');
+      didServiceMock.deployStorage.mockRejectedValueOnce(other);
+
+      await expect(walletService.deployManagerIdentity('vault_token')).rejects.toBe(other);
     });
   });
 });

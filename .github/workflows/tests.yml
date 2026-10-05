@@ -10,16 +10,103 @@ jobs:
       checks: write
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v6
+
+      # Install AlgoKit at the top of the workflow so the LocalNet sandbox
+      # can be brought up as early as possible and warm up in the background
+      # while the rest of the build steps run.
+      - name: Install AlgoKit
+        run: pipx install algokit
+
+      - name: Start AlgoKit LocalNet
+        run: algokit localnet start
+
+      - uses: actions/setup-go@v6
+        with:
+          # Matches the pin in vault/plugin/Dockerfile — see the comment there.
+          go-version: '1.23'
+          cache-dependency-path: vault/plugin/go.sum
+
+      - name: Vault PQ plugin tests
+        working-directory: vault/plugin
+        run: go test -race ./...
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.x'
+
+      - name: Enable Corepack
+        run: corepack enable
 
       - name: Install dependencies
-        run: yarn
+        run: yarn --frozen-lockfile --ignore-engines
+
+      - name: Lint check
+        run: yarn lint
+
+      - name: Format check
+        run: yarn format
 
       - uses: ArtiomTr/jest-coverage-report-action@v2
         with:
           package-manager: yarn
           test-script: yarn jest
 
-      - name: Format check
+      # Seed .env from the template before any docker compose step
+      - name: Seed .env from template
+        run: cp .env.template .env
+
+      # Sync GENESIS_ID / GENESIS_HASH from the running LocalNet into .env
+      # so pawn signs transactions with the correct genesis. LocalNet is
+      # already started above, so skip the start step inside the script.
+      - name: Sync LocalNet genesis into .env
+        run: SKIP_LOCALNET_START=1 ./scripts/setup_localnet.sh
+
+      # Reset Vault bind-mounted storage so Vault boots un-initialized.
+      # Vault writes its file storage as the in-image vault user (uid 100),
+      # so on the host the directory often ends up owned by root.
+      - name: Reset Vault bind-mounted storage
         run: |
-          yarn format --check
+          docker compose down -v --remove-orphans || true
+          if [ -e volumes/vault ]; then sudo rm -rf volumes/vault; fi
+          mkdir -p volumes/vault/file volumes/vault/logs volumes/vault/plugins
+          sudo chmod -R 777 volumes/vault
+
+      # The Vault container loads this binary from its plugin_directory, so it
+      # must exist before the stack starts. The reset step above wipes it.
+      - name: Build Vault PQ plugin
+        run: ./scripts/build_vault_plugin.sh
+
+      - name: Start docker compose stack (vault + pawn)
+        run: docker compose up -d --wait
+
+      #  Chown /opt/app inside the container to
+      # `node:node` so the init process can write to the bind mount.
+      - name: Make workspace writable for pawn container
+        run: docker compose exec -T --user root pawn chown -R node:node /opt/app
+
+      - name: Initialize Vault (development)
+        run: docker compose exec -T pawn yarn vault:development:init
+
+      - name: Recreate pawn to pick up updated .env
+        run: |
+          docker compose up -d --force-recreate --no-deps --wait pawn
+
+      - name: Prefund manager account on LocalNet
+        run: ./scripts/fund_manager.sh
+
+        #TODO: Resolve the node modules overriding
+      - name: Restore workspace ownership to runner, allow vault to write
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" . 
+          sudo chmod -R 777 volumes/vault
+      - name: Re-install dependencies
+        run: yarn
+      - name: E2E tests
+        run: yarn test:e2e
+
+      # Scoped to failures so passing runs stay quiet: the Vault-side reason a
+      # plugin mount or a signing call failed is only ever in the server log.
+      - name: Vault logs
+        if: failure()
+        run: docker compose logs --no-color vault
